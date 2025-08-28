@@ -1,89 +1,74 @@
-// /api/order-lookup.ts (Next.js "pages" API route) — Node runtime
+// Next.js "pages" API route
 import type { NextApiRequest, NextApiResponse } from 'next';
-import crypto from 'crypto';
 
-const API_SECRET   = process.env.SHOPIFY_API_SECRET || '';       // App's API secret (from Partner Dashboard)
-const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN; // Single-shop token (or fetch per-shop token in prod)
-const API_VERSION  = process.env.SHOPIFY_API_VERSION || '2025-07';
-const ALLOWED_SHOP = process.env.SHOPIFY_SHOP;                   // Optional hardening: your-shop.myshopify.com
+const ADMIN_TOKEN   = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
+const API_VERSION   = process.env.SHOPIFY_API_VERSION || '2025-07';
+const SHOP          = process.env.SHOPIFY_SHOP!;  // lock to your shop; don't read from the client
+const ALLOWED       = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()); // e.g. https://your-store.myshopify.com,https://yourdomain.com
+const RECAPTCHA_SEC = process.env.RECAPTCHA_SECRET || '';
+const MIN_SCORE     = Number(process.env.RECAPTCHA_MIN_SCORE || '0.5');
 
-function timingSafeEqual(a: string, b: string) {
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+function setCORS(res: NextApiResponse, origin?: string) {
+  if (origin && ALLOWED.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With');
 }
 
-// Verify App Proxy signature per Shopify docs (HMAC-SHA256 over sorted "key=value" with arrays joined by commas)
-function verifyProxySignature(req: NextApiRequest): boolean {
-  const url = new URL(req.url || '', `https://${req.headers.host}`);
-  const params = url.searchParams;
-
-  const provided = params.get('signature') || '';
-  if (!provided || !API_SECRET) return false;
-
-  // Build a multimap of all params except signature
-  const map = new Map<string, string[]>();
-  for (const [k, v] of params) {
-    if (k === 'signature') continue;
-    const arr = map.get(k) || [];
-    arr.push(v);
-    map.set(k, arr);
-  }
-
-  // Sort keys, join values with ',', then concatenate all pairs without '&'
-  const message = Array.from(map.keys())
-    .sort()
-    .map((k) => `${k}=${map.get(k)!.join(',')}`)
-    .join('');
-
-  const digest = crypto.createHmac('sha256', API_SECRET).update(message).digest('hex');
-  return timingSafeEqual(digest, provided);
+async function verifyRecaptcha(token: string, ip?: string) {
+  if (!RECAPTCHA_SEC) return true; // disabled
+  const body = new URLSearchParams({ secret: RECAPTCHA_SEC, response: token });
+  if (ip) body.set('remoteip', ip);
+  const r = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+  const j = await r.json();
+  if (!j.success) return false;
+  if (typeof j.score === 'number' && j.score < MIN_SCORE) return false;
+  return true;
 }
 
 function titleCase(s: string) {
-  return s.replace(/_/g, ' ').toLowerCase().replace(/(^|\s)\S/g, (m) => m.toUpperCase());
+  return s.replace(/_/g, ' ').toLowerCase().replace(/(^|\\s)\\S/g, m => m.toUpperCase());
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const origin = (req.headers.origin as string) || '';
+  setCORS(res, origin);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
   try {
-    // 1) Verify request really came through Shopify App Proxy
-    if (!verifyProxySignature(req)) {
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
+    // Only allow calls from your storefront origins
+    if (!ALLOWED.includes(origin)) return res.status(403).json({ error: 'Origin not allowed' });
 
     const url = new URL(req.url || '', `https://${req.headers.host}`);
-    const shop = url.searchParams.get('shop') || ''; // e.g. my-store.myshopify.com
     const orderRaw = (url.searchParams.get('order') || '').trim();
     const emailRaw = (url.searchParams.get('email') || '').trim().toLowerCase();
+    const captcha  = (url.searchParams.get('captchaToken') || '').trim(); // send this from the theme
 
-    if (!orderRaw || !emailRaw) {
-      return res.status(400).json({ error: 'Missing order or email' });
-    }
-    if (ALLOWED_SHOP && shop !== ALLOWED_SHOP) {
-      return res.status(403).json({ error: 'Shop not allowed' });
-    }
+    if (!orderRaw || !emailRaw) return res.status(400).json({ error: 'Missing order or email' });
+    if (!ADMIN_TOKEN || !SHOP)   return res.status(500).json({ error: 'Server not configured' });
 
-    // If you use per-shop OAuth, look up the token by "shop" here instead of using ADMIN_TOKEN
-    if (!ADMIN_TOKEN) {
-      return res.status(500).json({ error: 'Missing ADMIN API token on server' });
-    }
+    // Optional: CAPTCHA
+    const ok = await verifyRecaptcha(captcha, req.headers['x-forwarded-for'] as string);
+    if (!ok) return res.status(400).json({ error: 'Captcha failed' });
 
     const orderName = orderRaw.replace(/^#/, '');
-    // Escape single quotes for the search syntax
     const esc = (s: string) => s.replace(/'/g, "\\'");
     const q = `email:'${esc(emailRaw)}' AND name:'${esc(orderName)}'`;
 
-    const endpoint = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+    const endpoint = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
     const gql = `
       query ($q: String!) {
         orders(first: 1, query: $q) {
-          edges {
-            node {
-              name
-              displayFulfillmentStatus
-              statusPageUrl
-              fulfillments(first: 10) { trackingInfo { number url company } }
-            }
-          }
+          edges { node {
+            name
+            displayFulfillmentStatus
+            statusPageUrl
+            fulfillments(first: 10) { trackingInfo { number url company } }
+          } }
         }
       }`;
 
@@ -91,9 +76,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': ADMIN_TOKEN,
+        'X-Shopify-Access-Token': ADMIN_TOKEN
       },
-      body: JSON.stringify({ query: gql, variables: { q } }),
+      body: JSON.stringify({ query: gql, variables: { q } })
     });
 
     const data = await resp.json();
@@ -105,9 +90,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       orderName: node.name,
       displayStatus: titleCase(node.displayFulfillmentStatus || 'UNKNOWN'),
       statusPageUrl: node.statusPageUrl || null,
-      tracking: (node.fulfillments || []).flatMap((f: any) => f.trackingInfo || []),
+      tracking: (node.fulfillments || []).flatMap((f: any) => f.trackingInfo || [])
     });
-  } catch (err: any) {
-    return res.status(500).json({ error: err?.message || 'Server error' });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'Server error' });
   }
 }
+
+
