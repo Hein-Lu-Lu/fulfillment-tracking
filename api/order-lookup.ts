@@ -1,6 +1,18 @@
+
 // app/api/order-lookup/route.ts
 import { NextResponse } from 'next/server';
+export const runtime = 'nodejs';          // be explicit
+export const dynamic = 'force-dynamic';   // no caching
 
+export async function GET(req: Request) {
+  return NextResponse.json({
+    ok: true,
+    env: {
+      SHOP: !!process.env.SHOPIFY_SHOP,
+      TOKEN: !!process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+    },
+  });
+}
 
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
@@ -89,3 +101,4 @@ const captcha = (searchParams.get('captchaToken') || '').trim();
 if (!orderRaw || !emailRaw) {
 return NextResponse.json({ error: 'Missing order or email' }, { status: 400, headers: cors });
 }
+
